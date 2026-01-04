@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from src.from_scratch.distributed_batch_norm import SyncBatchNorm
+from from_scratch.syncbatchnorm import SyncBatchNorm
 
 
 def init_process(rank, world_size, fn, *args):
