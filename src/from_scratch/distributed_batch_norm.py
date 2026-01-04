@@ -20,7 +20,7 @@ class sync_batch_norm(Function):
         ctx: Any,
         input: torch.Tensor,
         running_mean: torch.Tensor | None,
-        running_std: torch.Tensor | None,
+        running_var: torch.Tensor | None,
         eps: float,
         momentum: float,
     ) -> torch.Tensor:
@@ -29,22 +29,22 @@ class sync_batch_norm(Function):
 
         Args:
             ctx: Контекст для сохранения данных для обратного прохода.
-            input (torch.Tensor): Входной тензор размерности (N, C, H, W).
-            running_mean (torch.Tensor | None): Накопленное среднее (буфер слоя).
-            running_std (torch.Tensor | None): Накопленное стандартное отклонение (буфер слоя).
-            eps (float): Малое число для стабильности (избежание деления на ноль).
-            momentum (float): Коэффициент инерции для обновления накопленных статистик.
+            input (torch.Tensor): Входной тензор.
+            running_mean (torch.Tensor | None): Накопленное среднее.
+            running_var (torch.Tensor | None): Накопленная дисперсия.
+            eps (float): Малое число для стабильности.
+            momentum (float): Коэффициент инерции.
 
         Returns:
-            torch.Tensor: Нормализованный тензор той же размерности, что и вход.
+            torch.Tensor: Нормализованный тензор.
         """
-        N, C, H, W = input.shape
-        dtype = input.dtype
-        device = input.device
+        C = input.shape[1]
+        dims = [0] + list(range(2, input.ndim))
+        view_shape = [1, C] + [1] * (input.ndim - 2)
 
-        local_count = torch.tensor([N * H * W], device=device, dtype=dtype)
-        local_x_sum = torch.sum(input, dim=(0, 2, 3))
-        local_x2_sum = torch.sum(input**2, dim=(0, 2, 3))
+        local_count = torch.tensor([input.numel() // C], device=input.device, dtype=input.dtype)
+        local_x_sum = torch.sum(input, dim=dims)
+        local_x2_sum = torch.sum(input**2, dim=dims)
 
         vector = torch.cat([local_count, local_x_sum, local_x2_sum], dim=0)
         dist.all_reduce(vector, op=dist.ReduceOp.SUM)
@@ -55,15 +55,16 @@ class sync_batch_norm(Function):
         var = (global_x2_sum / global_count) - (mean**2)
         std = torch.sqrt(var + eps)
 
-        if running_mean is not None and running_std is not None:
+        if running_mean is not None and running_var is not None:
+            unbiased_var = var * (global_count / (global_count - 1))
             running_mean.copy_((1 - momentum) * running_mean + momentum * mean)
-            running_std.copy_((1 - momentum) * running_std + momentum * std)
+            running_var.copy_((1 - momentum) * running_var + momentum * unbiased_var)
 
-        mean_4d = mean.view(1, C, 1, 1)
-        std_4d = std.view(1, C, 1, 1)
-        x_hat = (input - mean_4d) / std_4d
+        mean_v = mean.view(view_shape)
+        std_v = std.view(view_shape)
+        x_hat = (input - mean_v) / std_v
 
-        ctx.save_for_backward(x_hat, std_4d, global_count)
+        ctx.save_for_backward(x_hat, std_v, global_count)
 
         return x_hat
 
@@ -78,21 +79,22 @@ class sync_batch_norm(Function):
 
         Returns:
             Tuple[torch.Tensor, None, None, None, None]: Градиент по входу (input).
-                Остальные элементы None, так как по ним градиент не вычисляется.
         """
         x_hat, std, global_count = ctx.saved_tensors
         C = x_hat.shape[1]
+        dims = [0] + list(range(2, x_hat.ndim))
+        view_shape = [1, C] + [1] * (x_hat.ndim - 2)
 
-        local_sum_grad_output = torch.sum(grad_output, dim=(0, 2, 3))
-        local_sum_grad_output_x_hat = torch.sum(grad_output * x_hat, dim=(0, 2, 3))
+        local_sum_grad_output = torch.sum(grad_output, dim=dims)
+        local_sum_grad_output_x_hat = torch.sum(grad_output * x_hat, dim=dims)
 
         vector = torch.cat([local_sum_grad_output, local_sum_grad_output_x_hat], dim=0)
         dist.all_reduce(vector, op=dist.ReduceOp.SUM)
 
         global_sum_grad_output, global_sum_grad_output_x_hat = vector.chunk(2)
 
-        global_sum_grad_output = global_sum_grad_output.view(1, C, 1, 1)
-        global_sum_grad_output_x_hat = global_sum_grad_output_x_hat.view(1, C, 1, 1)
+        global_sum_grad_output = global_sum_grad_output.view(view_shape)
+        global_sum_grad_output_x_hat = global_sum_grad_output_x_hat.view(view_shape)
 
         grad_input = (
             1.0
@@ -122,28 +124,29 @@ class SyncBatchNorm(_BatchNorm):
             track_running_stats=True,
         )
         self.register_buffer("running_mean", torch.zeros((num_features,)))
-        self.register_buffer("running_std", torch.ones((num_features,)))
+        self.register_buffer("running_var", torch.ones((num_features,)))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """
         Выполняет нормализацию входа.
 
         Args:
-            input (torch.Tensor): Входной тензор (N, C, H, W).
+            input (torch.Tensor): Входной тензор.
 
         Returns:
             torch.Tensor: Результат нормализации.
         """
         if not self.training:
             C = self.running_mean.shape[0]
-            mean = self.running_mean.view(1, C, 1, 1)
-            std = self.running_std.view(1, C, 1, 1)
-            return (input - mean) / std
+            view_shape = [1, C] + [1] * (input.ndim - 2)
+            mean = self.running_mean.view(view_shape)
+            var = self.running_var.view(view_shape)
+            return (input - mean) / torch.sqrt(var + self.eps)
 
         return sync_batch_norm.apply(
             input,
             self.running_mean,
-            self.running_std,
+            self.running_var,
             self.eps,
             self.momentum,
         )
